@@ -72,7 +72,7 @@ class DaikinC10 {
   int16_t value{};
 };
 
-inline constexpr DaikinC10 SETPOINT_STEP{1.0F}; // Daikin setpoint granularity
+inline constexpr DaikinC10 SETPOINT_STEP{0.5F}; // Daikin setpoint granularity
 inline constexpr DaikinC10 TEMPERATURE_STEP{0.5F}; // Daikin temperature sensor granularity
 inline constexpr DaikinC10 TEMPERATURE_INVALID{DaikinC10::nan_sentinel}; // NaN
 
