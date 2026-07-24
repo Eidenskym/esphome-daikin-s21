@@ -1,6 +1,6 @@
 # esphome-daikin-s21
 
-ESPHome component to control Daikin indoor mini-split units using the wired
+ESPHome components to control Daikin indoor mini-split units using the wired
 protocol available over S21 and related ports.
 
 ***Upgrade Note***: If your automatic update failed, I may have changed some
@@ -26,6 +26,15 @@ A big thanks to:
 A short changelog of sorts, I'll keep things here where a user might encounter
 breaking or significant changes, including configuration updates.
 
+* Updated the state class of energy sensors to total_increasing so they
+  integrate into the Home Assistant Energy dashboard. The values still track the
+  unit's lifetime totals; they are seeded from the Daikin's own counter and
+  accumulated monotonically on-device, so the small backward dips the unit
+  reports on power loss are absorbed rather than published as a decrease, and
+  energy consumed after a dip is still counted. The totals are persisted
+  to flash to survive reboots and power loss. If flash wear is a concern (writes
+  are already coalesced and rate-limited by the 0.1 kWh resolution), raise the
+  `flash_write_interval` on the esp32 platform to reduce write frequency.
 * Binary sensor changes: Removed `valve`, use unit `active` instead for the
   same info. Renamed `multizone_conflict` to `multizone_online`, inverting
   logic and changing the device class. Added `system_online` to track all units
@@ -52,22 +61,6 @@ breaking or significant changes, including configuration updates.
   update rate that aren't actually that interesting. Changes to other values
   (action, fan mode, etc.) will still be published immediately. It can be
   omitted for free run operation if desired.
-* Added instantaneous unit power sensor.
-* Fixed compressor frequency sensor scaling. Please purge your history for this
-  sensor, the values will be incorrect.
-* Added additional energy consumption sensors for protocol 3.20+. Renamed
-  existing `power_consumption` to `energy_indoor` (briefly) to `energy`. Sorry.
-  Update your YAML.
-* Checksum calculation was fixed. There's a faint chance that a command or
-  query that was previously NAK'd actually now works.
-* Custom Silent fan mode changed to standard Quiet. Custom Automatic was also
-  updated to standard Auto to work around a validation issue, which results in
-  a nicer icon. Update any automations to specify these new mode settings.
-* Configuration schema for the climate component (specifically the unit
-  temperature range limits) has changed to organize them by mode as well as
-  adding a temperature offset to be applied when commanding the unit. Update
-  your configurations to the new schema (see example) if your project now fails
-  to compile.
 
 ## Features
 
@@ -111,6 +104,8 @@ The main control interface. Supported features:
     target temperature at a steady state so I add a +1.0C offset here.
   * Range limits for values sent to the unit. Defaults should work fine, but if
     your unit is different they can be overridden.
+* Optional `offset_interval` (default `5min`). period to recalculate the offset
+  between the "ideal" external reference sensor and the internal Daikin sensor.
 * Optional `setpoint_dither` (default `true`). When the ideal setpoint falls
   between the unit's steps, the commanded value is rounded in the direction of
   change so it oscillates over the ideal value over time. Set to `false` to
@@ -195,8 +190,9 @@ case for you and I can try to implement better control.
 
 ### Number
 
-* Demand Control (v2+, unverified). Select from 30%-100% of power output. As a
-  reference point, Econo limits this to around 70%.
+* Demand Control (v2+, unverified). Select from 30%-100% of conditioning power
+  output. As a reference point, the built in Econo mode limits this to around
+  70%.
 
 ## Feedback
 
@@ -297,8 +293,8 @@ details if you want a sensor or control added.
 **NOTE:** There was a serious issue when using the Arduino framework.
 If flashed OTA you may lose communication and require a physical reflashing
 (annoying if your board in inside your air handler). Please stick to the
-ESP-IDF PlatformIO framework for now (Arduino is an extra shim over the ESP-IDF
-SDK anyways). See the framework selection in the configuration example.
+ESP-IDF framework for now (Arduino is an extra shim over the ESP-IDF SDK
+anyways). See the framework selection in the configuration example.
 
 * Aforementioned S21 control limitations. Your unit may support a mode but
   support for controlling over S21 may not be there. See your model's
@@ -350,6 +346,22 @@ ESPHome's software UART implementation isn't viable for this application as it
 uses delays inside an interrupt routine. This might be accpetable at higher
 baud rates, but at 1200 baud the delays become too long and the system will
 watchdog out and reset. Just get an ESP32 board.
+
+ESPHome preferences (and the associated flash memory wear) are used in the
+following ways to save information over power cycles:
+
+* Temperature setpoints in the three main modes. Changing operation mode will
+  restore the last used setpoint for that mode by default.
+* Energy sensor totals for coherent reporting as `total_increasing` state
+  class. Daikin preserves these internally but at a lower resolution, so to
+  prevent a small amount of rollback if power is lost at the wrong time the
+  current high resolution value is preserved, making your energy dashboard in
+  Home Assistant glitch free.
+
+If these are a concern on your platform, raise the `flash_write_interval` to
+reduce write frequency at the cost of losing the current state if power is
+lost. The flash on an ESP32 device is rated for 100000 write cycles and ESPHome
+provides wear leveling so this isn't thought to be a concern.
 
 ### S21 Port
 
@@ -730,7 +742,7 @@ daikin_s21:
   uart: s21_uart
 ```
 
-Here's an example of ESP32 dev board using direct wiring:
+Here's an example of an ESP32 dev board using direct wiring:
 
 ```yaml
 uart:
