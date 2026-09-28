@@ -26,6 +26,16 @@ A big thanks to:
 A short changelog of sorts, I'll keep things here where a user might encounter
 breaking or significant changes, including configuration updates.
 
+* Added vertical angle setpoint emulation for units that lack the setpoint
+  command. Horizontal swing setting is now preserved while using this control
+  for both methods. The discrete step should be preserved in the UI afterwards
+  if vertical swing isn't changed.
+* Climate action can now report defrosting instead of a short cooling period.
+  If this is always on while heating your unit doesn't support the state
+  reporting bits and can be blacklisted. Open an issue.
+* Added enforcement for a non-zero update interval at compile time. If you have
+  an `update_interval` of 0s specified in any polling components (s21, climate,
+  sensor) please change this to `never` to indicate the intent is to free run.
 * Modified humidity control to add support for humid heating. The setting is
   now also applied when switching to heating or cooling modes and only updated
   in those modes so the setting is preserved over mode changes.
@@ -44,17 +54,6 @@ breaking or significant changes, including configuration updates.
   on a compressor. Compressor `short_cycle` device class of lock removed; this
   was showing up in the HA Security dashboard. History will be inverted and
   should be purged if it matters to you.
-* Bumped minimum ESPHome version to 2026.4.0 in order to address a few issues.
-  If you have an `update_interval` of 0s specified in any polling components
-  (s21, climate, sensor) please change this to `never` to indicate the intent
-  to not poll. My code will treat this a request to free run and publish
-  updates when available. Improvements to ESPHome's scheduler mean 0s polls are
-  now honoured immediately and watchdog timeouts will occur. As of today
-  there's no warning or mitigation during codegen. My code will avoid these
-  lockups for now but in 2026.4.1 you'll see very tight polling loops until you
-  update your config, so update them now. At some point down the line I will
-  remove my local mitigation and ESPHome compile time warnings will serve.
-  See [15516](https://github.com/esphome/esphome/pull/15516) and [15799](https://github.com/esphome/esphome/pull/15799).
 * ***Important***: Updated configuration schema of climate component. The
   previous `update_interval` is moved to `offset_interval`. This is the period
   where the external reference temperature sensor offset is applied to the
@@ -159,9 +158,16 @@ changes.
   there's no need to enable the Sensor LED or Sensor Mode switches or binary
   sensors.
 
-* Vertical swing setpoint. v2+ may support this. Preset values can be selected
-  for the vertical louver, including the standard on and off for the varrying
-  setting.
+* Vertical swing setpoint. Command the vertical louvre to a preset angle and
+  stop there. Horizontal swing is preserved during this time. Some units (v2+)
+  may support a command to do this directly. On those that don't, vertical
+  swing is temporarily enabled and an attempt is made to pause the louvre in
+  the general area of the desired angle. This is only going to work well if the
+  core query rate is in free run or else the polled angle will be stale. These
+  angles can be optionally configured per action and are only used when there's
+  no command support. The range may vary on your unit, turn on vertical swing
+  and monitor the angles for your mode and unit to come up with your presets.
+  Dry action uses cool's angles.
 
 * Humidity operation. v2+ may support this on "Ururu Sarara" units. Controls
   humidity while in heating and cooling modes to provide dry cooling or humid
@@ -222,7 +228,7 @@ example configuration.
   not the user setpoint and not that interesting to me but may be useful for
   your automations.
 * Fan speed of inside blower.
-* Vertical swing angle of louver. This uses Daikin's reference frame.
+* Vertical swing angle of louvre. This uses Daikin's reference frame.
 * Compressor frequency of the outside exchanger.
 * Humidity. Not supported on all units, can report a consistent 50% or 0% if
   not present.
@@ -294,12 +300,6 @@ support, rather than trying to interpret the string via HA. Open an issue with
 details if you want a sensor or control added.
 
 ## Limitations
-
-**NOTE:** There was a serious issue when using the Arduino framework.
-If flashed OTA you may lose communication and require a physical reflashing
-(annoying if your board in inside your air handler). Please stick to the
-ESP-IDF framework for now (Arduino is an extra shim over the ESP-IDF SDK
-anyways). See the framework selection in the configuration example.
 
 * Aforementioned S21 control limitations. Your unit may support a mode but
   support for controlling over S21 may not be there. See your model's
@@ -474,7 +474,7 @@ The default is 1.0°C to match Daikin's internal granularity.
 
 ```yaml
 esphome:
-  min_version: "2026.5.0"
+  min_version: "2026.7.0"
   devices:
     - id: daikin_outdoor
       name: "Daikin Compressor"
@@ -558,6 +558,10 @@ select:
       name: Humidity
     vertical_swing:
       name: Vertical Swing
+      # angles for vertical swing setpoint angles, from top to bottom
+      # cool_action: [80, 70, 60, 50, 44] # shared with dry
+      # fan_only_action: [87, 66, 46, 26, 5]
+      # heat_action: [66, 53, 40, 27, 14]
 
 sensor:
   - platform: daikin_s21

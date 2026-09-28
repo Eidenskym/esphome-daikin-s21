@@ -34,7 +34,7 @@ class DaikinS21 : public PollingComponent {
   void set_demand_control(uint8_t percent);
   void set_vertical_swing_mode(DaikinVerticalSwingMode swing);
 
-  enum ReadoutRequest {
+  enum ReadoutRequest : uint8_t {
     // binary sensor
     ReadoutErrorStatus,
     ReadoutUnitStateBits,
@@ -63,14 +63,14 @@ class DaikinS21 : public PollingComponent {
     ReadoutCount, // just for bitset sizing
   };
   void request_readout(const ReadoutRequest request) { this->readout_requests.set(request); }
-
+  void set_vertical_angle_setpoints(const climate::ClimateAction action, const VerticalAngleSetpoints &&setpoints) { this->angle_setpoints.get(action) = setpoints; }
   void add_debug_query(std::string_view query_str);
 
   // callbacks called when a query cycle is complete
   CallbackManager<void(void)> update_callbacks{};
 
   // value accessors
-  bool is_ready() { return this->ready.all(); }
+  bool is_ready() const { return this->ready.all(); }
   auto get_climate() const { return this->climate.value(); }
   auto get_climate_action() const { return this->action; }
   auto get_swing_mode() const { return this->swing_humidity.value().swing; }
@@ -83,13 +83,13 @@ class DaikinS21 : public PollingComponent {
   auto get_temp_coil() const { return this->temp_coil; }
   auto get_fan_rpm_setpoint() const { return this->fan_rpm_setpoint; }
   auto get_fan_rpm() const { return this->fan_rpm; }
-  auto get_swing_vertical_angle_setpoint() const { return this->swing_vertical_angle_setpoint; }
-  auto get_swing_vertical_angle() const { return this->swing_vertical_angle; }
+  auto get_swing_vertical_angle_setpoint() const { return this->vertical_angle_setpoint; }
+  auto get_swing_vertical_angle() const { return this->vertical_angle; }
   auto get_ir_counter() const { return this->ir_counter; }
   auto get_energy_consumption_total() const { return this->energy_.total.value(); }
   auto get_energy_consumption_cooling() const { return this->energy_.cooling.value(); }
   auto get_energy_consumption_heating() const { return this->energy_.heating.value(); }
-  auto get_vertical_swing_mode() const { return this->vertical_swing_mode.value(); }
+  auto get_vertical_swing_mode() const { return this->louvres.mode; }
   auto get_outdoor_capacity() const { return this->outdoor_capacity; }
   auto get_unit_power_watts() const { return this->unit_power * 10; }
   auto get_compressor_frequency() const { return this->compressor_hz; }
@@ -123,6 +123,8 @@ class DaikinS21 : public PollingComponent {
 
   // communication state
   void handle_serial_idle();
+  void louvre_runtime();
+  void louvre_terminate();
   bool is_free_run() const { return this->get_update_interval() == SCHEDULER_DONT_RUN; }
   void trigger_cycle();
   void start_cycle();
@@ -181,7 +183,7 @@ class DaikinS21 : public PollingComponent {
 
   // serial
   uart::UARTComponent& uart;
-  std::vector<uint8_t> response = std::vector<uint8_t>(MAX_RESPONSE_SIZE);
+  FixedVector<uint8_t> response{};
   enum class CommState : uint8_t {
     CommandAck,
     QueryAck,
@@ -212,16 +214,15 @@ class DaikinS21 : public PollingComponent {
   bool cycle_triggered{};
   bool cycle_active{};
 
-  // debugging support
-  bool debug_comms{};
-  bool debug_protocol{};
+  // combined states
+  LouvreState louvres{};
 
   // settings
   CommandState<DaikinClimateSettings> climate{};
   CommandState<DaikinSwingHumiditySettings> swing_humidity{};
   CommandState<DaikinSpecialModes> special_modes{};
   CommandState<DaikinDemandEcono> demand_econo{};
-  CommandState<DaikinVerticalSwingMode> vertical_swing_mode{};
+  CommandState<DaikinVerticalSwingMode> vertical_swing{};
 
   // current values
   uint16_t unit_power{};  // W/10
@@ -232,8 +233,8 @@ class DaikinS21 : public PollingComponent {
   uint16_t fan_rpm_setpoint{};  // not supported
   uint16_t fan_rpm{};
   uint16_t compressor_hz{};
-  int16_t swing_vertical_angle_setpoint{};  // not supported
-  int16_t swing_vertical_angle{};
+  int16_t vertical_angle_setpoint{};  /**< Vertical louvre angle setpoint. */
+  int16_t vertical_angle{};           /**< Vertical louvre angle. */
   uint16_t ir_counter{};
   // energy accumulators, persisted as one blob so totals survive reboots and power loss
   struct EnergyCounters {
@@ -245,8 +246,8 @@ class DaikinS21 : public PollingComponent {
   ESPPreferenceObject energy_pref_{};
   uint8_t humidity{50};
   uint8_t demand_pull{};
-  climate::ClimateAction action_reported = climate::CLIMATE_ACTION_OFF; // raw readout
-  climate::ClimateAction action = climate::CLIMATE_ACTION_OFF; // corrected at end of cycle
+  climate::ClimateAction action_reported{}; // raw readout, last action if idle
+  climate::ClimateAction action{}; // corrected at end of cycle
   DaikinUnitState unit_state{};
   DaikinSystemState system_state{};
   bool active{};      // actively using the compressor
@@ -261,6 +262,17 @@ class DaikinS21 : public PollingComponent {
   std::array<char, 8+1> software_revision{"unknown"};
   std::array<char, 22+1> model_name{"unknown"};
   uint8_t outdoor_capacity{};
+
+  // config
+  bool debug_comms{};
+  bool debug_protocol{};
+  struct VerticalModeAngleSetpoints {
+    VerticalAngleSetpoints cool{};
+    VerticalAngleSetpoints fan_only{};
+    VerticalAngleSetpoints heat{};
+
+    VerticalAngleSetpoints& get(climate::ClimateAction action);
+  } angle_setpoints{};
 
   struct {
     // for alternate readout

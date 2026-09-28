@@ -88,6 +88,10 @@ constexpr climate::ClimateAction s21_to_climate_action(const uint8_t action) {
   }
 }
 
+constexpr bool is_vertical_setpoint_action(const climate::ClimateAction action) {
+  return (action == climate::CLIMATE_ACTION_COOLING) || (action == climate::CLIMATE_ACTION_HEATING) || (action == climate::CLIMATE_ACTION_FAN) || (action == climate::CLIMATE_ACTION_DRYING);
+}
+
 static constexpr std::array<uint8_t, climate::CLIMATE_SWING_HORIZONTAL + 1> climate_swing_encodings = {{
   '0',  // CLIMATE_SWING_OFF
   '7',  // CLIMATE_SWING_BOTH
@@ -96,6 +100,14 @@ static constexpr std::array<uint8_t, climate::CLIMATE_SWING_HORIZONTAL + 1> clim
 }};
 constexpr auto s21_to_climate_swing_mode = encoding_to_enum<climate::ClimateSwingMode, climate_swing_encodings>;
 constexpr auto climate_swing_mode_to_s21 = enum_to_encoding<climate::ClimateSwingMode, climate_swing_encodings>;
+
+constexpr bool is_horizontal_active(const climate::ClimateSwingMode mode) {
+  return (mode == climate::CLIMATE_SWING_HORIZONTAL) || (mode == climate::CLIMATE_SWING_BOTH);
+}
+
+constexpr bool is_vertical_active(const climate::ClimateSwingMode mode) {
+  return (mode == climate::CLIMATE_SWING_VERTICAL) || (mode == climate::CLIMATE_SWING_BOTH);
+}
 
 static constexpr std::array<uint8_t, DaikinHumidityModeCount> humid_heat_encodings = {{
   '0',  // off
@@ -126,6 +138,10 @@ static constexpr std::array<uint8_t, DaikinVerticalSwingModeCount> vertical_swin
 }};
 constexpr auto s21_to_vertical_swing_mode = encoding_to_enum<DaikinVerticalSwingMode, vertical_swing_mode_encodings>;
 
+constexpr bool is_vertical_setpoint(const DaikinVerticalSwingMode mode) {
+  return (mode >= DaikinVerticalSwingTop) && (mode <= DaikinVerticalSwingBottom);
+}
+
 static constexpr std::array<const char *, ActiveSourceCount> active_source_strings = {{
   "unknown",
   "Rg",
@@ -143,7 +159,7 @@ static constexpr std::array<const char *, PowerfulSourceCount> powerful_source_s
 /**
  * Apply the characteristics of a new vertical swing mode to a climate swing mode
  */
-void apply_vertical_swing_mode(const DaikinVerticalSwingMode vertical_swing, climate::ClimateSwingMode &swing) {
+constexpr void apply_vertical_swing_mode(const DaikinVerticalSwingMode vertical_swing, climate::ClimateSwingMode &swing) {
   if (vertical_swing == DaikinVerticalSwingOn) {
     if (swing == climate::CLIMATE_SWING_OFF) {
       swing = climate::CLIMATE_SWING_VERTICAL;
@@ -162,20 +178,11 @@ void apply_vertical_swing_mode(const DaikinVerticalSwingMode vertical_swing, cli
 /**
  * Apply the characteristics of a new climate swing mode to a vertical swing mode
  */
-void apply_swing_mode(const climate::ClimateSwingMode swing, DaikinVerticalSwingMode &vertical_swing) {
-  switch (swing) {
-    case climate::CLIMATE_SWING_OFF:
-    case climate::CLIMATE_SWING_HORIZONTAL:
-      if (vertical_swing == DaikinVerticalSwingOn) { // don't overwrite discrete steps
-        vertical_swing = DaikinVerticalSwingOff;
-      }
-      break;
-    case climate::CLIMATE_SWING_VERTICAL:
-    case climate::CLIMATE_SWING_BOTH:
-      vertical_swing = DaikinVerticalSwingOn;
-      break;
-    default:
-      break;
+constexpr void apply_swing_mode(const climate::ClimateSwingMode swing, DaikinVerticalSwingMode &vertical_swing) {
+  if (is_vertical_active(swing)) {
+    vertical_swing = DaikinVerticalSwingOn;
+  } else if (vertical_swing == DaikinVerticalSwingOn) { // don't overwrite discrete steps
+    vertical_swing = DaikinVerticalSwingOff;
   }
 }
 
@@ -247,7 +254,7 @@ DaikinS21::DaikinS21(uart::UARTComponent * const uart)
     {EnvironmentQuery::LiquidTemperature, &DaikinS21::handle_env_liquid_temperature, 4},
     // {EnvironmentQuery::FanSpeedSetpoint, &DaikinS21::handle_env_fan_speed_setpoint, 3},  // not supported yet, can translate DaikinFanMode to RPM
     {EnvironmentQuery::FanSpeed, &DaikinS21::handle_env_fan_speed, 3},
-    // {EnvironmentQuery::LouverAngleSetpoint, &DaikinS21::handle_env_vertical_swing_angle_setpoint, 4},  // not supported yet
+    // {EnvironmentQuery::LouvreAngleSetpoint, &DaikinS21::handle_env_vertical_swing_angle_setpoint, 4},  // not supported, slow update rate means limited use for direct control
     {EnvironmentQuery::VerticalSwingAngle, &DaikinS21::handle_env_vertical_swing_angle, 4},
     // {EnvironmentQuery::RW, &DaikinS21::handle_nop, 2},  // unknown, "00" for me
     {EnvironmentQuery::TargetTemperature, &DaikinS21::handle_env_target_temperature, 4},
@@ -272,14 +279,11 @@ void DaikinS21::setup() {
   this->energy_pref_ = global_preferences->make_preference<EnergyCounters>(fnv1_hash("daikin_s21_energy"));
   this->energy_pref_.load(&this->energy_);  // leaves defaults (unseeded) if nothing stored
 
-  // mitigation, remove when 2026.4.1 released
-  if (this->get_update_interval() <= 1) {
-    this->set_update_interval(SCHEDULER_DONT_RUN);
-    this->stop_poller();
-  }
-
   // start 1min periodic state dump timer
   this->set_interval(60*1000, [this](){ this->dump_state(); });
+
+  // allocate serial result buffer
+  this->response.init(MAX_RESPONSE_SIZE);
 
   // kick off initial query scan
   this->reset_queries();  // importantly schedules initial queries
@@ -415,9 +419,9 @@ void DaikinS21::set_climate_settings(const DaikinClimateSettings climate) {
     this->climate.stage(climate);
     // stage the humidity value as well if changing to heating or cooling
     if ((prev_climate.mode != climate.mode) &&
-        (this->swing_humidity.value().humidity != DaikinHumidityOff) &&
+        (this->get_humidity_mode() != DaikinHumidityOff) &&
         ((climate.mode == climate::CLIMATE_MODE_HEAT) || (climate.mode == climate::CLIMATE_MODE_COOL))) {
-        this->swing_humidity.stage({ this->get_swing_mode(), this->get_humidity_mode() });
+        this->swing_humidity.stage({ this->get_swing_mode(), this->get_humidity_mode() });  // bypass change detection, climate hasn't been processed yet
     }
     this->trigger_cycle();
   }
@@ -425,6 +429,11 @@ void DaikinS21::set_climate_settings(const DaikinClimateSettings climate) {
 
 void DaikinS21::set_swing_mode(const climate::ClimateSwingMode swing) {
   if (this->get_swing_mode() != swing) {
+    // allow user to request horizontal swing changes when vertical control ends if command mode is active
+    if (this->louvres.is_command_active()) {
+      this->louvres.horizontal_swing = is_horizontal_active(swing);
+    }
+    // apply the new swing mode now
     this->swing_humidity.stage({ swing, this->get_humidity_mode() }); // shares D6 with humidity, stage complete command
     this->trigger_cycle();
   }
@@ -462,7 +471,7 @@ void DaikinS21::set_mode(const DaikinMode mode, const bool enable) {
 void DaikinS21::set_brightness_mode(const DaikinLEDBrightnessMode brightness) {
   bool led = false;
   bool motion = false;
-  switch(brightness) {
+  switch (brightness) {
     case DaikinLEDBrightnessHigh:
       led = true;
       break;
@@ -498,10 +507,46 @@ void DaikinS21::set_demand_control(const uint8_t percent) {
 /**
  * Set the vertical swing mode and trigger a write to the unit if it changed.
  */
-void DaikinS21::set_vertical_swing_mode(DaikinVerticalSwingMode swing) {
-  if (this->get_vertical_swing_mode() != swing) {
-    this->vertical_swing_mode.stage(swing);
-    this->trigger_cycle();
+void DaikinS21::set_vertical_swing_mode(const DaikinVerticalSwingMode swing) {
+  if (this->louvres.mode != swing) {
+    // set UI to the commanded choice
+    this->louvres.mode = swing;
+    // handle the request
+    if ((swing == DaikinVerticalSwingOff) || (swing == DaikinVerticalSwingOn)) {
+      // binary setting, delegate to the regular swing mode command
+      auto climate_swing = this->get_swing_mode();
+      apply_vertical_swing_mode(swing, climate_swing);
+      this->set_swing_mode(climate_swing);
+    } else if (this->action_reported != climate::CLIMATE_ACTION_OFF) {  // setpoint mode, ignore when off
+      // both paths use the angle query, save current state when enabling to restore when done and enable it
+      auto& angle_query = this->get_query(EnvironmentQuery::VerticalSwingAngle);
+      if (this->louvres.enabled == false) {
+        this->louvres.angle_query = angle_query.enabled;
+      }
+      angle_query.enabled = true;
+      auto climate_swing = this->get_swing_mode();
+      if (this->louvres.command_support) {
+        // use of vertical swing mode command will clear basic swing mode, remember if horizontal was enabled to reapply afterwards
+        if (this->louvres.enabled == false) {
+          this->louvres.horizontal_swing = is_horizontal_active(climate_swing);
+        }
+        // apply the vertical swing mode via command
+        this->vertical_swing.stage(swing);
+        this->trigger_cycle();
+        this->louvres.timeout_ms = App.get_loop_component_start_time() + LouvreState::CommandTimeoutMs;
+      } else {
+        // pick a setpoint, enable vertical swing and wait for it to converge
+        this->louvres.pause_setpoint = this->angle_setpoints.get(this->action_reported)[swing - DaikinVerticalSwingTop];  // use the last active action
+        apply_vertical_swing_mode(DaikinVerticalSwingOn, climate_swing);  // preserve existing horizontal setting
+        ESP_LOGD(TAG, "Vertical setpoint control set to %" PRId16 "°", this->louvres.pause_setpoint);
+        this->set_swing_mode(climate_swing);
+        this->louvres.timeout_ms = App.get_loop_component_start_time() + LouvreState::PauseTimeoutMs;
+      }
+      this->louvres.enabled = true;
+    } else {  // TODO future support for comfort mode
+      // unsupported, clear state
+      this->louvres.mode = DaikinVerticalSwingOff;
+    }
   }
 }
 
@@ -800,11 +845,13 @@ void DaikinS21::handle_serial_result(const SerialResult result) {
     case SerialResult::Error:
       ESP_LOGE(TAG, "Error with %" PRI_SV, PRI_SV_ARGS(tx_str));
       // something went terribly wrong, try to reinitialize communications
+      this->louvre_terminate();
+      this->louvres = {};
       this->climate.reset();
       this->swing_humidity.reset();
       this->special_modes.reset();
       this->demand_econo.reset();
-      this->vertical_swing_mode.reset();
+      this->vertical_swing.reset();
       this->active_query = this->queries.end(); // end the query cycle early, let handle_serial_idle resume communication when error state times out
       break;
   }
@@ -836,10 +883,10 @@ void DaikinS21::handle_serial_result(const SerialResult result) {
  * - Start the next cycle if free running or triggered in polling mode
  */
 void DaikinS21::handle_serial_idle() {
+  const auto cycle_interval = this->get_cycle_interval_ms();
   std::array<uint8_t, 4U> payload = {'0','0','0','0'};  // all command payloads here are 4 bytes long for now
 
   // Apply any pending settings
-  const auto cycle_interval = this->get_cycle_interval_ms();
   if (this->climate.staged()) {
     payload[0] = (this->climate.pending.mode == climate::CLIMATE_MODE_OFF) ? '0' : '1'; // power
     payload[1] = climate_mode_to_s21(this->climate.pending.mode);
@@ -862,10 +909,10 @@ void DaikinS21::handle_serial_idle() {
     }
     this->send_command(StateCommand::SwingHumidityModes, payload);
     this->swing_humidity.set_confirm_ms(cycle_interval);
-    // keep vertical swing mode in sync
-    this->vertical_swing_mode.pending = this->get_vertical_swing_mode();
-    apply_swing_mode(this->swing_humidity.pending.swing, this->vertical_swing_mode.pending);
-    this->vertical_swing_mode.set_confirm_ms(cycle_interval);
+    // keep related state in sync
+    this->vertical_swing.pending = this->get_vertical_swing_mode();
+    apply_swing_mode(this->swing_humidity.pending.swing, this->vertical_swing.pending);
+    this->vertical_swing.set_confirm_ms(cycle_interval);
     return;
   }
 
@@ -903,13 +950,13 @@ void DaikinS21::handle_serial_idle() {
     return;
   }
 
-  if (this->vertical_swing_mode.staged()) {
-    payload[0] = vertical_swing_mode_encodings[this->vertical_swing_mode.pending];
+  if (this->vertical_swing.staged()) {
+    payload[0] = vertical_swing_mode_encodings[this->vertical_swing.pending];
     this->send_command(StateCommand::VerticalSwingMode, payload);
-    this->vertical_swing_mode.set_confirm_ms(cycle_interval);
-    // keep regular swing mode state in sync
+    this->vertical_swing.set_confirm_ms(cycle_interval);
+    // keep related state in sync
     this->swing_humidity.pending.swing = this->get_swing_mode();
-    apply_vertical_swing_mode(this->vertical_swing_mode.pending, this->swing_humidity.pending.swing);
+    apply_vertical_swing_mode(this->vertical_swing.pending, this->swing_humidity.pending.swing);
     this->swing_humidity.set_confirm_ms(cycle_interval);
     return;
   }
@@ -921,34 +968,113 @@ void DaikinS21::handle_serial_idle() {
   }
 
   // Query cycle complete
-  this->cycle_active = false;
   this->cycle_time_ms = App.get_loop_component_start_time() - this->cycle_time_start_ms;
   if (this->is_ready() == false) {
     this->ready_state_machine();
   } else {
-    // resolve action
-    if (this->unit_state.defrost() && (this->action_reported == climate::CLIMATE_ACTION_HEATING)) {
-      this->action = climate::CLIMATE_ACTION_COOLING; // report cooling during defrost
-    } else if (this->active || (this->action_reported == climate::CLIMATE_ACTION_FAN) || (this->action_reported == climate::CLIMATE_ACTION_OFF)) {
-      this->action = this->action_reported; // trust the unit when active or in fan only or off
-    } else {
-      this->action = climate::CLIMATE_ACTION_IDLE;
-    }
-
     // resolve pending commands
     this->climate.check_confirm();
     this->swing_humidity.check_confirm();
     this->special_modes.check_confirm();
     this->demand_econo.check_confirm();
-    this->vertical_swing_mode.check_confirm();
+    this->vertical_swing.check_confirm();
+
+    // resolve action
+    if (this->unit_state.defrost() && (this->action_reported == climate::CLIMATE_ACTION_HEATING)) {
+      this->action = climate::CLIMATE_ACTION_DEFROSTING;
+    } else if (this->active || (this->action_reported == climate::CLIMATE_ACTION_FAN) || (this->action_reported == climate::CLIMATE_ACTION_OFF)) {
+      this->action = this->action_reported; // trust the unit when active or fan only or off
+    } else {
+      this->action = climate::CLIMATE_ACTION_IDLE;  // could be reporting last action but not active
+    }
+
+    // resolve vertical swing
+    this->louvre_runtime();
 
     // signal there's fresh data to consumers
     this->update_callbacks.call();
   }
 
   // Start fresh polling query cycle (triggered never cleared in free run)
+  this->cycle_active = false;
   if (this->cycle_triggered) {
     this->start_cycle();
+  }
+}
+
+/**
+ * Runs post-scan louvre tasks.
+ */
+void DaikinS21::louvre_runtime() {
+  // start/stop control
+  if (this->louvres.enabled) {
+    if (timestamp_passed(App.get_loop_component_start_time(), this->louvres.timeout_ms)) {
+      // disable if timeout passed
+      if (this->louvres.command_support == false) {
+        ESP_LOGW(TAG, "Vertical setpoint control timeout");
+      }
+      this->louvre_terminate();
+    } else if (this->louvres.command_support == is_vertical_active(this->get_swing_mode())) {
+      // override vertical control if swing being enabled in command mode or disabled in swing pause mode
+      this->louvre_terminate();
+    }
+    if ((this->louvres.enabled == false) && (this->louvres.command_support == false)) {
+      this->louvres.mode = DaikinVerticalSwingOff;  // failed, clear setpoint or else it will be preserved below
+    }
+  } else {
+    // enable the state machine if the IR remote was used to select a setpoint
+    if (is_vertical_setpoint(this->vertical_swing.active)) {
+      this->louvres.mode = this->vertical_swing.active;
+      this->louvres.enabled = true;
+      // previous horizontal state captured during readout
+      this->louvres.angle_query = true; // don't touch whatever's configured on termination
+      this->louvres.timeout_ms = App.get_loop_component_start_time() + LouvreState::CommandTimeoutMs;
+    }
+  }
+  if (this->louvres.enabled == false) {
+    if (is_vertical_setpoint(this->vertical_swing.value())) {
+      this->louvres.mode = this->vertical_swing.value();  // report vertical swing sensor if setpoint active
+    } else if (is_vertical_active(this->get_swing_mode())) {  // vertical swing sensor is applied to regular swing
+      this->louvres.mode = DaikinVerticalSwingOn;
+    } else if (is_vertical_setpoint(this->louvres.mode)) {
+      // preserve last discrete step when off is reported
+    } else if ((this->louvres.command_support == false) && is_vertical_setpoint_action(this->action_reported)) {  // attempt to recover setpoint if swing pause
+      // find the closest setpoint for the current range, then see if it's close enough to the current angle
+      auto &setpoints = this->angle_setpoints.get(this->action_reported);
+      auto closest = std::ranges::min_element(setpoints, {}, [this](const auto &setpoint){ return std::abs(this->vertical_angle - setpoint); });  // don't have to search them all, but it's only 5
+      if (std::abs(this->vertical_angle - *closest) <= LouvreState::SwingPauseTolerance) {
+        this->louvres.mode = static_cast<DaikinVerticalSwingMode>(DaikinVerticalSwingTop + std::ranges::distance(setpoints.begin(), closest));
+      } else {
+        this->louvres.mode = DaikinVerticalSwingOff;  // not at a setpoint
+      }
+    } else {
+      this->louvres.mode = DaikinVerticalSwingOff;
+    }
+  }
+}
+
+/**
+ * Terminates the louvre runtime.
+ *
+ * Runs cleanup actions when terminating control
+ */
+void DaikinS21::louvre_terminate() {
+  if (this->louvres.enabled) {
+    this->louvres.enabled = false;
+    // disable queries if they weren't previously enabled
+    if (this->louvres.angle_query == false) {
+      this->get_query(EnvironmentQuery::VerticalSwingAngle).enabled = false;
+    }
+    // restore swing state
+    auto climate_swing = this->get_swing_mode();
+    if (this->louvres.command_support) {
+      // apply pended horizontal swing in setpoint command mode
+      climate_swing = this->louvres.horizontal_swing ? climate::CLIMATE_SWING_HORIZONTAL : climate::CLIMATE_SWING_OFF;
+    } else {
+      // disable vertical component in swing pause mode
+      apply_vertical_swing_mode(DaikinVerticalSwingOff, climate_swing);
+    }
+    this->set_swing_mode(climate_swing);
   }
 }
 
@@ -1048,11 +1174,13 @@ void DaikinS21::ready_state_machine() {
   // Finally, all queries should be scheduled and important ones read out
   if (this->is_ready()) {
     // Populate pending state caches with current values so change detection on future commands works
+    this->louvre_terminate();
+    this->louvres = {};
     this->climate.reset();
     this->swing_humidity.reset();
     this->special_modes.reset();
     this->demand_econo.reset();
-    this->vertical_swing_mode.reset();
+    this->vertical_swing.reset();
 
     // Schedule any user specified debug queries, done last so as to not duplicate automatically added queries
     for (auto &query : this->queries | std::views::filter(DaikinQuery::IsDebug)) {
@@ -1089,7 +1217,7 @@ void DaikinS21::check_ready_protocol_detection() {
   }
 
   // check if complete and handle results if so
-  this->ready[ReadyProtocolDetection] = this->protocol_version != ProtocolUndetected;
+  this->ready[ReadyProtocolDetection] = (this->protocol_version != ProtocolUndetected);
   if (this->ready[ReadyProtocolDetection]) {
     ESP_LOGD(TAG, "Protocol version %" PRIu8 ".%" PRIu8 " detected", this->protocol_version.major, this->protocol_version.minor);
     // >= ProtocolVersion(0)
@@ -1367,6 +1495,7 @@ void DaikinS21::send_command(const std::string_view command, const std::span<con
 }
 
 void DaikinS21::handle_state_basic(const std::span<const uint8_t> payload) {
+  const auto prev_mode = this->climate.active.mode;
   if (payload[0] == '0') {
     this->climate.active.mode = climate::CLIMATE_MODE_OFF;
     this->action_reported = climate::CLIMATE_ACTION_OFF;
@@ -1378,6 +1507,11 @@ void DaikinS21::handle_state_basic(const std::span<const uint8_t> payload) {
   // silent fan mode not reported here so prefer RG if present
   if (this->support.fan_mode_query == false) {
     this->climate.active.fan = s21_to_fan_mode(payload[3]);
+  }
+  // cancel setpoint swing modes when changing operation
+  if ((prev_mode != this->climate.active.mode) && is_vertical_setpoint(this->louvres.mode)) {
+      this->louvre_terminate();
+      this->louvres.mode = DaikinVerticalSwingOff;
   }
 }
 
@@ -1394,8 +1528,8 @@ void DaikinS21::handle_state_swing_humidity_modes(const std::span<const uint8_t>
   } else {
     this->swing_humidity.active.humidity = this->swing_humidity.pending.humidity; // keep the current humidity setting in other modes
   }
-  // keep vertical swing mode in sync
-  apply_swing_mode(this->swing_humidity.active.swing, this->vertical_swing_mode.active);
+  // keep related state in sync
+  apply_swing_mode(this->swing_humidity.active.swing, this->vertical_swing.active);
 }
 
 void DaikinS21::handle_state_special_modes(const std::span<const uint8_t> payload) {
@@ -1439,9 +1573,15 @@ void DaikinS21::handle_state_energy_consumption_total(const std::span<const uint
 }
 
 void DaikinS21::handle_state_vertical_swing_mode(const std::span<const uint8_t> payload) {
-  this->vertical_swing_mode.active = s21_to_vertical_swing_mode(payload[0]);
-  // keep regular swing mode in sync
-  apply_vertical_swing_mode(this->vertical_swing_mode.active, this->swing_humidity.active.swing);
+  this->vertical_swing.active = s21_to_vertical_swing_mode(payload[0]);
+  this->louvres.command_support = true; // TODO move check to initialization
+  // integrate IR remote driven change to the louvre state machine
+  if ((this->louvres.enabled == false) && is_vertical_setpoint(this->vertical_swing.active)) {
+    // attempt to capture existing horizontal swing mode, may be too late but best effort when dealing with IR remote
+    this->louvres.horizontal_swing = is_horizontal_active(this->get_swing_mode());
+  }
+  // keep related state in sync
+  apply_vertical_swing_mode(this->vertical_swing.active, this->swing_humidity.active.swing);
 }
 
 void DaikinS21::handle_state_outdoor_capacity(const std::span<const uint8_t> payload) {
@@ -1505,8 +1645,8 @@ void DaikinS21::handle_env_temperature_setpoint(const std::span<const uint8_t> p
 /** Same info as StateQuery::SwingHumidityModes */
 void DaikinS21::handle_env_swing_mode(const std::span<const uint8_t> payload) {
   this->swing_humidity.active.swing = s21_to_climate_swing_mode(payload[0]);
-  // keep vertical swing mode in sync
-  apply_swing_mode(this->swing_humidity.active.swing, this->vertical_swing_mode.active);
+  // keep related state in sync
+  apply_swing_mode(this->swing_humidity.active.swing, this->vertical_swing.active);
 }
 
 /** Better info than StateQuery::Basic (reports silent) */
@@ -1531,11 +1671,18 @@ void DaikinS21::handle_env_fan_speed(const std::span<const uint8_t> payload) {
 }
 
 void DaikinS21::handle_env_vertical_swing_angle_setpoint(const std::span<const uint8_t> payload) {
-  this->swing_vertical_angle_setpoint = bytes_to_num(payload);
+  this->vertical_angle_setpoint = bytes_to_num(payload);
 }
 
 void DaikinS21::handle_env_vertical_swing_angle(const std::span<const uint8_t> payload) {
-  this->swing_vertical_angle = bytes_to_num(payload);
+  this->vertical_angle = bytes_to_num(payload);
+  // reduce latency by servicing the swing angle state machine as soon as there's a new measurement
+  if (this->louvres.is_pause_active()) {
+    if (std::abs(this->vertical_angle - this->louvres.pause_setpoint) <= LouvreState::SwingPauseTolerance) {
+      ESP_LOGD(TAG, "Vertical setpoint control successful, terminating at %" PRId16 "°", this->vertical_angle);
+      this->louvre_terminate();
+    }
+  }
 }
 
 void DaikinS21::handle_env_target_temperature(const std::span<const uint8_t> payload) {
@@ -1596,6 +1743,19 @@ void DaikinS21::handle_misc_software_version(std::span<const uint8_t> payload) {
   if (payload.size() <= (this->software_version.size()-1)) {
     std::ranges::reverse_copy(payload, this->software_version.begin());
     this->software_version[payload.size()] = 0;
+  }
+}
+
+VerticalAngleSetpoints& DaikinS21::VerticalModeAngleSetpoints::get(const climate::ClimateAction action) {
+  switch (action) {
+    case climate::CLIMATE_ACTION_COOLING:
+    case climate::CLIMATE_ACTION_DRYING:
+      return this->cool;
+    case climate::CLIMATE_ACTION_HEATING:
+      return this->heat;
+    case climate::CLIMATE_ACTION_FAN:
+    default:  // the most permissive
+      return this->fan_only;
   }
 }
 
